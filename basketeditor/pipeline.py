@@ -47,15 +47,20 @@ def run_pipeline(
         ):
             raise ValueError(f"Please add at least one positive point for {target!r}.")
 
-    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
     output_root = output_root or REPO_DIR / "outputs"
     output_dir = output_root / f"{Path(info.path).stem}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=False)
+    tracks_file = output_dir / "tracks.json"
+    events_file = output_dir / "events.json"
+    debug_video = output_dir / "debug_tracking.mp4"
 
     if progress:
         progress(0.05, desc="Extracting frames for SAM2 tracking")
     with tempfile.TemporaryDirectory(prefix="sam2_frames_", dir=output_dir) as temp:
-        frames_dir = Path(temp)
+        frames_dir = Path(temp) / "frames"
+        masks_dir = Path(temp) / "masks"
+        frames_dir.mkdir()
         extract_tracking_frames(info, frames_dir, cv2)
         if progress:
             progress(
@@ -71,16 +76,19 @@ def run_pipeline(
             device,
             sam2_repo,
             np,
+            masks_dir,
+            cv2,
         )
 
-    if progress:
-        progress(0.75, desc="Applying trajectory rules and detecting attacks")
-    frame_states = build_frame_states(tracks)
-    events = detect_attacks(frame_states, info)
+        if progress:
+            progress(0.75, desc="Applying trajectory rules and detecting attacks")
+        frame_states = build_frame_states(tracks)
+        events = detect_attacks(frame_states, info)
 
-    tracks_file = output_dir / "tracks.json"
-    events_file = output_dir / "events.json"
-    debug_video = output_dir / "debug_tracking.mp4"
+        if progress:
+            progress(0.82, desc="Generating H.264 debug tracking video")
+        export_debug_video(info, frame_states, debug_video, masks_dir, np, cv2)
+
     _write_json(
         tracks_file,
         {
@@ -106,9 +114,6 @@ def run_pipeline(
             ],
         },
     )
-    if progress:
-        progress(0.82, desc="Generating debug tracking video")
-    export_debug_video(info, frame_states, debug_video, cv2)
     if progress:
         progress(0.93, desc="Exporting valid attack clips")
     clips = cut_clips(info, events, output_dir)

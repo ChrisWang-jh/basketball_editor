@@ -5,18 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .models import VideoInfo
 from .pipeline import run_pipeline
 from .sam2 import Sam2Preview
 from .video import (
     annotation_summary,
     draw_annotations_and_masks,
     read_frame,
+    read_video_info,
 )
 
 
 def create_interface(
-    info: VideoInfo,
+    video_paths: list[Path],
+    video_root: Path,
     checkpoint: Path,
     model_config: str,
     device: str,
@@ -25,30 +26,107 @@ def create_interface(
     cv2: Any,
     gr: Any,
 ) -> Any:
-    """创建标注 UI；点击提示点后即时显示当前帧的 SAM2 掩码。"""
+    """创建可切换多个视频的标注 UI。"""
+    if not video_paths:
+        raise ValueError("At least one video is required.")
+    paths = [str(path.resolve()) for path in video_paths]
+    path_indexes = {path: index for index, path in enumerate(paths)}
+    info_cache: dict[str, Any] = {}
+
+    def get_info(video_path: str) -> Any:
+        if video_path not in path_indexes:
+            raise ValueError(f"Unknown video: {video_path}")
+        if video_path not in info_cache:
+            info_cache[video_path] = read_video_info(Path(video_path), cv2)
+        return info_cache[video_path]
+
+    def get_annotations(
+        annotation_map: dict[str, list[dict[str, Any]]] | None, video_path: str
+    ) -> list[dict[str, Any]]:
+        return list((annotation_map or {}).get(video_path, []))
+
+    def set_annotations(
+        annotation_map: dict[str, list[dict[str, Any]]] | None,
+        video_path: str,
+        annotations: list[dict[str, Any]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        updated = dict(annotation_map or {})
+        updated[video_path] = annotations
+        return updated
+
+    def video_summary(video_path: str) -> str:
+        current = get_info(video_path)
+        position = path_indexes[video_path] + 1
+        return (
+            f"**Video {position}/{len(paths)}:** `{current.path}`  \n"
+            f"FPS: {current.fps:.3f}　frames: {current.frame_count}　"
+            f"duration: {current.duration:.1f} s"
+        )
+
+    initial_path = paths[0]
+    info = get_info(initial_path)
     initial_frame = read_frame(info, 0, cv2)
     preview = Sam2Preview(checkpoint, model_config, device, sam2_repo, np)
 
-    def render_frame(frame_idx: float, annotations: list[dict[str, Any]]) -> Any:
+    def render_frame(
+        video_path: str,
+        frame_idx: float,
+        annotation_map: dict[str, list[dict[str, Any]]] | None,
+    ) -> Any:
+        current = get_info(video_path)
         frame_idx = round(frame_idx)
-        frame = read_frame(info, frame_idx, cv2)
-        masks = preview.predict(frame, frame_idx, annotations)
+        annotations = get_annotations(annotation_map, video_path)
+        frame = read_frame(current, frame_idx, cv2)
+        masks = preview.predict(frame, frame_idx, annotations, source_key=video_path)
         return draw_annotations_and_masks(frame, frame_idx, annotations, masks, np, cv2)
 
     def change_frame(
-        frame_idx: float, annotations: list[dict[str, Any]]
+        video_path: str,
+        frame_idx: float,
+        annotation_map: dict[str, list[dict[str, Any]]] | None,
     ) -> tuple[Any, str]:
-        return render_frame(frame_idx, annotations), annotation_summary(annotations)
+        annotations = get_annotations(annotation_map, video_path)
+        return (
+            render_frame(video_path, frame_idx, annotation_map),
+            annotation_summary(annotations),
+        )
+
+    def switch_video(
+        video_path: str,
+        annotation_map: dict[str, list[dict[str, Any]]] | None,
+    ) -> tuple[str, Any, Any, str, str, None]:
+        current = get_info(video_path)
+        annotations = get_annotations(annotation_map, video_path)
+        preview.reset_frame()
+        return (
+            video_summary(video_path),
+            read_frame(current, 0, cv2),
+            gr.update(minimum=0, maximum=current.frame_count - 1, value=0),
+            annotation_summary(annotations),
+            "Analysis has not started for this video.",
+            None,
+        )
+
+    def move_video(
+        offset: int,
+        video_path: str,
+        annotation_map: dict[str, list[dict[str, Any]]] | None,
+    ) -> tuple[Any, str, Any, Any, str, str, None]:
+        index = (path_indexes[video_path] + offset) % len(paths)
+        next_path = paths[index]
+        return (gr.update(value=next_path), *switch_video(next_path, annotation_map))
 
     def click_image(
         target: str,
         point_type: str,
-        annotations: list[dict[str, Any]],
+        annotation_map: dict[str, list[dict[str, Any]]] | None,
+        video_path: str,
         frame_idx: float,
         evt: Any,
-    ) -> tuple[Any, list[dict[str, Any]], str]:
+    ) -> tuple[Any, dict[str, list[dict[str, Any]]], str]:
         x, y = evt.index
         frame_idx = round(frame_idx)
+        annotations = get_annotations(annotation_map, video_path)
         updated = [
             *annotations,
             {
@@ -59,9 +137,10 @@ def create_interface(
                 "label": 1 if point_type == "positive" else 0,
             },
         ]
+        updated_map = set_annotations(annotation_map, video_path, updated)
         return (
-            render_frame(frame_idx, updated),
-            updated,
+            render_frame(video_path, frame_idx, updated_map),
+            updated_map,
             annotation_summary(updated),
         )
 
@@ -70,27 +149,42 @@ def create_interface(
     click_image.__annotations__["evt"] = gr.SelectData
 
     def undo(
-        annotations: list[dict[str, Any]], frame_idx: float
-    ) -> tuple[Any, list[dict[str, Any]], str]:
+        annotation_map: dict[str, list[dict[str, Any]]] | None,
+        video_path: str,
+        frame_idx: float,
+    ) -> tuple[Any, dict[str, list[dict[str, Any]]], str]:
+        annotations = get_annotations(annotation_map, video_path)
         updated = annotations[:-1] if annotations else []
+        updated_map = set_annotations(annotation_map, video_path, updated)
         return (
-            render_frame(frame_idx, updated),
-            updated,
+            render_frame(video_path, frame_idx, updated_map),
+            updated_map,
             annotation_summary(updated),
         )
 
-    def clear_all(frame_idx: float) -> tuple[Any, list[dict[str, Any]], str]:
-        return read_frame(info, frame_idx, cv2), [], annotation_summary([])
+    def clear_all(
+        annotation_map: dict[str, list[dict[str, Any]]] | None,
+        video_path: str,
+        frame_idx: float,
+    ) -> tuple[Any, dict[str, list[dict[str, Any]]], str]:
+        updated_map = set_annotations(annotation_map, video_path, [])
+        preview.reset_frame()
+        return (
+            read_frame(get_info(video_path), frame_idx, cv2),
+            updated_map,
+            annotation_summary([]),
+        )
 
     def start_analysis(
-        annotations: list[dict[str, Any]],
+        video_path: str,
+        annotation_map: dict[str, list[dict[str, Any]]] | None,
         progress: Any = gr.Progress(),  # noqa: B008
     ) -> tuple[str, list[str]]:
         try:
             preview.release()
             return run_pipeline(
-                info,
-                annotations,
+                get_info(video_path),
+                get_annotations(annotation_map, video_path),
                 checkpoint,
                 model_config,
                 device,
@@ -104,14 +198,27 @@ def create_interface(
 
     with gr.Blocks(title="Basketball Attack Clip Extractor") as demo:
         gr.Markdown(
-            f"# Basketball Attack Clip Extractor\n\n"
-            f"video: `{info.path}`　FPS: {info.fps:.3f}　"
-            f"frame count: {info.frame_count}　duration: {info.duration:.1f} s\n\n"
+            "# Basketball Attack Clip Extractor\n\n"
             "Select a target and frame, then click directly on the image. "
             "SAM2 will preview the segmentation mask on annotated frames. "
-            "Add ball points on 3-10 clear frames."
+            "Annotations are retained separately when switching videos."
         )
-        annotation_state = gr.State([])
+        annotation_state = gr.State({})
+        choices = [
+            (path.relative_to(video_root.resolve()).as_posix(), str(path.resolve()))
+            for path in video_paths
+        ]
+        with gr.Row():
+            previous_video = gr.Button("← Previous", scale=1)
+            video_selector = gr.Dropdown(
+                choices=choices,
+                value=initial_path,
+                label="Video",
+                interactive=True,
+                scale=5,
+            )
+            next_video = gr.Button("Next →", scale=1)
+        video_meta = gr.Markdown(video_summary(initial_path))
         with gr.Row():
             with gr.Column(scale=4):
                 image = gr.Image(
@@ -143,29 +250,60 @@ def create_interface(
         run_status = gr.Markdown("Analysis has not started.")
         result_files = gr.File(label="result files", file_count="multiple")
 
+        switch_outputs = [
+            video_meta,
+            image,
+            frame_slider,
+            stats,
+            run_status,
+            result_files,
+        ]
+        video_selector.change(
+            switch_video,
+            inputs=[video_selector, annotation_state],
+            outputs=switch_outputs,
+        )
+        navigation_outputs = [video_selector, *switch_outputs]
+        previous_video.click(
+            lambda path, state: move_video(-1, path, state),
+            inputs=[video_selector, annotation_state],
+            outputs=navigation_outputs,
+        )
+        next_video.click(
+            lambda path, state: move_video(1, path, state),
+            inputs=[video_selector, annotation_state],
+            outputs=navigation_outputs,
+        )
+
         frame_slider.change(
             change_frame,
-            inputs=[frame_slider, annotation_state],
+            inputs=[video_selector, frame_slider, annotation_state],
             outputs=[image, stats],
         )
         image.select(
             click_image,
-            inputs=[target_selector, point_type, annotation_state, frame_slider],
+            inputs=[
+                target_selector,
+                point_type,
+                annotation_state,
+                video_selector,
+                frame_slider,
+            ],
             outputs=[image, annotation_state, stats],
         )
         undo_button.click(
             undo,
-            inputs=[annotation_state, frame_slider],
+            inputs=[annotation_state, video_selector, frame_slider],
             outputs=[image, annotation_state, stats],
         )
         clear_button.click(
             clear_all,
-            inputs=[frame_slider],
+            inputs=[annotation_state, video_selector, frame_slider],
             outputs=[image, annotation_state, stats],
         )
         start_button.click(
             start_analysis,
-            inputs=[annotation_state],
+            inputs=[video_selector, annotation_state],
             outputs=[run_status, result_files],
         )
     return demo

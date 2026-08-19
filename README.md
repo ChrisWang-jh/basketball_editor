@@ -24,14 +24,17 @@ pip install numpy opencv-python gradio torch torchvision
 
 ### 2. 启动界面
 
+把包含原始视频的文件夹传给启动脚本。程序会递归查找其中的
+`.mp4`、`.mov`、`.mkv`、`.avi`、`.webm` 等视频：
+
 ```bash
-python run.py /path/to/source/video --sam2-repo third_party/sam2
+python run.py /path/to/source/videos --sam2-repo third_party/sam2
 ```
 
 如需指定设备：
 
 ```bash
-python run.py /path/to/source/video \
+python run.py /path/to/source/videos \
   --sam2-repo third_party/sam2 \
   --device cuda
 ```
@@ -40,11 +43,12 @@ python run.py /path/to/source/video \
 
 ### 3. 标注与分析
 
-1. 选择视频帧以及 `player`、`hoop` 或 `ball`。
-2. 点击画面添加前景点；追踪到错误区域时可添加排除点。
-3. 主人公和篮筐至少各添加一个前景点。
-4. 建议在 3～10 个清晰帧中重复标注篮球。
-5. 点击 **Start tracking and clipping** 开始分析。
+1. 用顶部的下拉框或左右按钮切换视频；每个视频的标注会分别保留。
+2. 选择视频帧以及 `player`、`hoop` 或 `ball`。
+3. 点击画面添加前景点；追踪到错误区域时可添加排除点。
+4. 主人公和篮筐至少各添加一个前景点。
+5. 建议在 3～10 个清晰帧中重复标注篮球。
+6. 点击 **Start tracking and clipping** 开始分析当前视频。
 
 结果会写入：
 
@@ -52,7 +56,27 @@ python run.py /path/to/source/video \
 outputs/<视频名称_分析时间>/
 ```
 
-其中包括轨迹数据、事件数据、调试视频以及识别出的进攻片段。
+其中包括轨迹数据、事件数据、调试视频以及识别出的进攻片段。调试视频使用
+浏览器兼容的 H.264 编码，并持续显示主人公、篮筐和篮球的 mask、轮廓、名称、
+bounding box 及当前追踪状态。
+
+### 4. 选择并拼接进攻片段
+
+启动独立的拼接界面（默认递归搜索项目的 `outputs/`）：
+
+```bash
+python stitch_ui.py
+```
+
+也可以指定其他输出目录和端口：
+
+```bash
+python stitch_ui.py /path/to/outputs --port 16667
+```
+
+界面只收集文件名以 `attack` 开头的视频。用左右按钮浏览，点击
+**Select current** 按最终顺序选择，再点击 **Stitch selected clips**。程序会先统一
+分辨率、帧率和音频格式，再输出 `stitched_<时间>.mp4` 到所选输出目录。
 
 ## 项目结构
 
@@ -64,4 +88,6 @@ basketeditor/rules.py     补帧、平滑与进攻识别规则
 basketeditor/pipeline.py  分析流程编排
 basketeditor/video.py     视频读写与结果导出
 basketeditor/models.py    数据模型和规则参数
+stitch_ui.py              attack 片段拼接界面入口
+basketeditor/stitch.py    视频标准化与拼接
 ```

@@ -4,10 +4,41 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from .models import COLORS, AttackEvent, FrameState, VideoInfo
+
+VIDEO_EXTENSIONS = {
+    ".avi",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".webm",
+}
+
+
+def discover_videos(directory: Path) -> list[Path]:
+    """递归查找目录中的视频，并按相对路径稳定排序。"""
+    directory = directory.expanduser().resolve()
+    if not directory.is_dir():
+        raise NotADirectoryError(f"Video directory not found: {directory}")
+    videos = [
+        path.resolve()
+        for path in directory.rglob("*")
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS
+    ]
+    videos.sort(key=lambda path: path.relative_to(directory).as_posix().casefold())
+    if not videos:
+        supported = ", ".join(sorted(VIDEO_EXTENSIONS))
+        raise FileNotFoundError(
+            f"No videos found below {directory}. Supported extensions: {supported}"
+        )
+    return videos
 
 
 def read_video_info(video_path: Path, cv2: Any) -> VideoInfo:
@@ -145,46 +176,176 @@ def extract_tracking_frames(info: VideoInfo, directory: Path, cv2: Any) -> None:
 
 
 def export_debug_video(
-    info: VideoInfo, frame_states: list[FrameState], output: Path, cv2: Any
+    info: VideoInfo,
+    frame_states: list[FrameState],
+    output: Path,
+    masks_dir: Path,
+    np: Any,
+    cv2: Any,
 ) -> None:
-    """把三类目标轨迹和当前状态画回视频，便于检查追踪和规则。"""
+    """把 mask、框和状态画回视频，并编码为浏览器可播放的 H.264 MP4。"""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg was not found. Install it and add it to PATH.")
     capture = cv2.VideoCapture(info.path)
-    codec = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output), codec, info.fps, (info.width, info.height))
-    if not writer.isOpened():
-        capture.release()
-        raise RuntimeError("Could not create debug video.")
-    for frame in frame_states:
-        ok, image = capture.read()
-        if not ok:
-            break
-        for target, point in (
-            ("player", frame.player),
-            ("hoop", frame.hoop),
-            ("ball", frame.ball),
-        ):
-            if point.visible and point.bbox is not None:
-                x1, y1, x2, y2 = map(int, point.bbox)
-                cv2.rectangle(image, (x1, y1), (x2, y2), COLORS[target], 2)
-        stage_id = {
-            "idle": 0,
-            "possession": 1,
-            "pending_release": 2,
-            "attack_active": 3,
-            "cooldown": 4,
-        }.get(frame.stage, 0)
-        cv2.putText(
-            image,
-            f"stage:{stage_id} frame:{frame.frame_idx}",
-            (20, 35),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
-            2,
+    if not capture.isOpened():
+        raise RuntimeError(f"Could not open source video for debug export: {info.path}")
+
+    temp_output = output.with_name(f".{output.stem}.encoding.mp4")
+    command = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s:v",
+        f"{info.width}x{info.height}",
+        "-r",
+        f"{info.fps:.10f}",
+        "-i",
+        "pipe:0",
+        "-an",
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "21",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(temp_output),
+    ]
+    written = 0
+    error_text = ""
+    with tempfile.TemporaryFile(mode="w+b") as error_log:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=error_log,
         )
-        writer.write(image)
-    capture.release()
-    writer.release()
+        try:
+            if process.stdin is None:
+                raise RuntimeError("Could not open the FFmpeg input pipe.")
+            for frame in frame_states:
+                ok, image = capture.read()
+                if not ok:
+                    raise RuntimeError(
+                        f"Source video ended while reading debug frame {frame.frame_idx}."
+                    )
+                for target, point in (
+                    ("player", frame.player),
+                    ("hoop", frame.hoop),
+                    ("ball", frame.ball),
+                ):
+                    mask_path = masks_dir / target / f"{frame.frame_idx:08d}.png"
+                    mask = (
+                        cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                        if mask_path.is_file()
+                        else None
+                    )
+                    if mask is not None and mask.shape == image.shape[:2]:
+                        selected = mask > 0
+                        if bool(np.any(selected)):
+                            color = np.asarray(COLORS[target], dtype=np.float32)
+                            blended = (
+                                image[selected].astype(np.float32) * 0.62 + color * 0.38
+                            )
+                            image[selected] = np.clip(blended, 0, 255).astype(np.uint8)
+                            contours, _ = cv2.findContours(
+                                selected.astype(np.uint8),
+                                cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_SIMPLE,
+                            )
+                            cv2.drawContours(
+                                image, contours, -1, COLORS[target], 2, cv2.LINE_AA
+                            )
+                    if point.visible and point.bbox is not None:
+                        x1, y1, x2, y2 = [round(value) for value in point.bbox]
+                        x1, x2 = sorted((max(0, x1), min(info.width - 1, x2)))
+                        y1, y2 = sorted((max(0, y1), min(info.height - 1, y2)))
+                        cv2.rectangle(
+                            image, (x1, y1), (x2, y2), COLORS[target], 3, cv2.LINE_AA
+                        )
+                        suffix = " interpolated" if point.interpolated else ""
+                        cv2.putText(
+                            image,
+                            f"{target}{suffix}",
+                            (x1, max(24, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.65,
+                            COLORS[target],
+                            2,
+                            cv2.LINE_AA,
+                        )
+
+                cv2.rectangle(image, (10, 8), (470, 76), (0, 0, 0), -1)
+                cv2.putText(
+                    image,
+                    f"frame:{frame.frame_idx}  stage:{frame.stage}",
+                    (20, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                visibility = "  ".join(
+                    f"{name}:{'on' if point.visible else 'missing'}"
+                    for name, point in (
+                        ("player", frame.player),
+                        ("hoop", frame.hoop),
+                        ("ball", frame.ball),
+                    )
+                )
+                cv2.putText(
+                    image,
+                    visibility,
+                    (20, 62),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                process.stdin.write(image.tobytes())
+                written += 1
+            process.stdin.close()
+            return_code = process.wait()
+        except (BrokenPipeError, OSError) as exc:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            process.wait()
+            temp_output.unlink(missing_ok=True)
+            raise RuntimeError(
+                "FFmpeg stopped while encoding the debug video."
+            ) from exc
+        except Exception:
+            if process.stdin is not None and not process.stdin.closed:
+                process.stdin.close()
+            process.wait()
+            temp_output.unlink(missing_ok=True)
+            raise
+        finally:
+            capture.release()
+            error_log.seek(0)
+            error_text = error_log.read().decode("utf-8", errors="replace")
+
+    if return_code != 0 or written != len(frame_states):
+        temp_output.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Debug video export failed: " + (error_text[-1000:] or "unknown error")
+        )
+    if not temp_output.is_file() or temp_output.stat().st_size == 0:
+        raise RuntimeError("FFmpeg did not create a complete debug video.")
+    temp_output.replace(output)
 
 
 def cut_clips(

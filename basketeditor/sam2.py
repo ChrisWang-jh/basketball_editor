@@ -91,6 +91,8 @@ def run_sam2_tracking(
     device_setting: str,
     sam2_repo: Path | None,
     np: Any,
+    masks_dir: Path | None = None,
+    cv2: Any = None,
 ) -> dict[str, list[TrackPoint]]:
     """注入三个目标的提示点，并对视频进行前向和反向掩码传播。"""
     if not checkpoint.is_file():
@@ -112,6 +114,11 @@ def run_sam2_tracking(
         ) from exc
 
     track_dict: dict[str, dict[int, TrackPoint]] = {target: {} for target in TARGET_IDS}
+    if masks_dir is not None:
+        if cv2 is None:
+            raise ValueError("cv2 is required when masks_dir is provided.")
+        for target in TARGET_IDS:
+            (masks_dir / target).mkdir(parents=True, exist_ok=True)
 
     def consume_output(output: tuple[Any, Any, Any]) -> None:
         frame_idx_value, obj_ids, mask_values = output
@@ -122,7 +129,8 @@ def run_sam2_tracking(
             target = ID_TO_TARGET.get(int(raw_obj_id))
             if target is None:
                 continue
-            candidate = mask_to_track_point(frame_idx, mask_values[position], np)
+            raw_mask = mask_values[position]
+            candidate = mask_to_track_point(frame_idx, raw_mask, np)
             current = track_dict[target].get(frame_idx)
             if (
                 current is None
@@ -130,6 +138,23 @@ def run_sam2_tracking(
                 or candidate.confidence > current.confidence
             ):
                 track_dict[target][frame_idx] = candidate
+                if masks_dir is not None and candidate.visible:
+                    if hasattr(raw_mask, "detach"):
+                        raw_mask = raw_mask.detach()
+                    if hasattr(raw_mask, "float"):
+                        raw_mask = raw_mask.float()
+                    if hasattr(raw_mask, "cpu"):
+                        raw_mask = raw_mask.cpu()
+                    if hasattr(raw_mask, "numpy"):
+                        raw_mask = raw_mask.numpy()
+                    mask_array = np.squeeze(np.asarray(raw_mask)) > 0.0
+                    mask_path = masks_dir / target / f"{frame_idx:08d}.png"
+                    if not cv2.imwrite(
+                        str(mask_path), mask_array.astype(np.uint8) * 255
+                    ):
+                        raise RuntimeError(
+                            f"Could not write tracking mask: {mask_path}"
+                        )
 
     groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for point in annotations:
@@ -196,7 +221,7 @@ class Sam2Preview:
         self.predictor: Any = None
         self.torch: Any = None
         self.device: str | None = None
-        self.frame_idx: int | None = None
+        self.frame_key: tuple[str, int] | None = None
 
     def _ensure_predictor(self) -> tuple[Any, Any, str]:
         if self.predictor is not None:
@@ -227,8 +252,12 @@ class Sam2Preview:
                 f"{self.model_config!r} and checkpoint."
             ) from exc
         self.predictor, self.torch, self.device = predictor, torch, device
-        self.frame_idx = None
+        self.frame_key = None
         return predictor, torch, device
+
+    def reset_frame(self) -> None:
+        """让下一次预览重新向 predictor 注入图像。"""
+        self.frame_key = None
 
     def release(self) -> None:
         """释放预览模型，避免与视频 predictor 同时占用显存。"""
@@ -236,7 +265,7 @@ class Sam2Preview:
         if predictor is not None:
             with suppress(Exception):
                 predictor.reset_predictor()
-        self.predictor = self.torch = self.device = self.frame_idx = None
+        self.predictor = self.torch = self.device = self.frame_key = None
         gc.collect()
         if torch is not None and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -246,6 +275,7 @@ class Sam2Preview:
         frame: Any,
         frame_idx: int,
         annotations: list[dict[str, Any]],
+        source_key: str = "",
     ) -> dict[str, Any]:
         """为当前帧有正提示点的目标生成预览掩码。"""
         current = [
@@ -254,10 +284,11 @@ class Sam2Preview:
         if not any(int(point["label"]) == 1 for point in current):
             return {}
         predictor, torch, device = self._ensure_predictor()
-        if self.frame_idx != int(frame_idx):
+        frame_key = (source_key, int(frame_idx))
+        if self.frame_key != frame_key:
             with torch.inference_mode(), _autocast(torch, device):
                 predictor.set_image(frame)
-            self.frame_idx = int(frame_idx)
+            self.frame_key = frame_key
 
         masks_by_target: dict[str, Any] = {}
         for target in TARGET_IDS:
