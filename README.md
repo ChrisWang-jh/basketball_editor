@@ -2,7 +2,7 @@
 
 BasketEditor 是一个基于 SAM2 的篮球视频进攻片段提取工具。
 
-用户通过网页界面标注主人公、篮筐和篮球后，程序会追踪三个目标，对篮球轨迹进行短缺失补帧和平滑处理，并根据“主人公控球 → 发动进攻 → 篮球碰框”的时序规则识别有效进攻，最后自动导出对应的视频片段。
+用户通过网页界面标注主人公、篮筐和篮球后，工具会追踪三个目标，对篮球轨迹进行短缺失补帧和平滑处理，并根据“主人公控球 → 发动进攻 → 篮球碰框”的时序规则识别有效进攻，最后自动导出对应的视频片段。
 
 项目不区分投篮是否命中，也不需要训练额外的事件识别模型。
 
@@ -13,7 +13,11 @@ BasketEditor 是一个基于 SAM2 的篮球视频进攻片段提取工具。
 建议使用 Python 3.10 或更高版本，并安装基础依赖：
 
 ```bash
+conda create -n basketedit python=3.10
+conda activate basketedit
 pip install numpy opencv-python gradio torch torchvision
+
+mkdir {checkpoints, third_party}
 ```
 
 此外还需要：
@@ -22,7 +26,7 @@ pip install numpy opencv-python gradio torch torchvision
 - 准备官方 SAM2 仓库。本项目已将其放在 `third_party/sam2` 时，可以直接使用该路径。
 - 将匹配的 SAM2 权重放在 `checkpoints/`。默认权重文件为 `checkpoints/sam2.1_hiera_base_plus.pt`。
 
-### 2. 启动界面
+### 2. 启动剪视频ui
 
 把包含原始视频的文件夹传给启动脚本。程序会递归查找其中的
 `.mp4`、`.mov`、`.mkv`、`.avi`、`.webm` 等视频：
@@ -60,7 +64,7 @@ outputs/<视频名称_分析时间>/
 浏览器兼容的 H.264 编码，并持续显示主人公、篮筐和篮球的 mask、轮廓、名称、
 bounding box 及当前追踪状态。
 
-### 4. 选择并拼接进攻片段
+### 4. 启动拼视频ui
 
 启动独立的拼接界面（默认递归搜索项目的 `outputs/`）：
 
