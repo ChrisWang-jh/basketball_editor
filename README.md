@@ -9,6 +9,10 @@ BasketEditor 是一个基于 SAM2 的篮球视频进攻片段提取工具。
 
 ## Demo
 
+
+https://github.com/user-attachments/assets/90b6c9fc-8071-4142-8427-3e0a49e3ad6c
+
+
 <video width="720" controls>
   <source src="assets/demo.mp4" type="video/mp4">
   Your browser does not support the video tag.
