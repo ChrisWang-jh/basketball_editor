@@ -6,7 +6,13 @@ BasketEditor 是一个基于 SAM2 的篮球视频进攻片段提取工具。
 
 项目不区分投篮是否命中，也不需要训练额外的事件识别模型。
 
-https://github.com/ChrisWang-jh/basketball_editor/assets/demo.mp4
+
+## Demo
+
+<video width="720" controls>
+  <source src="assets/demo.mp4" type="video/mp4">
+  Your browser does not support the video tag.
+</video>
 
 ## Quick Start
 
