@@ -22,7 +22,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from basketeditor.models import REPO_DIR
+from basketeditor.models import REPO_DIR, ReIDOptions
+from basketeditor.network import configure_local_proxy_bypass
 from basketeditor.ui import create_interface
 from basketeditor.video import discover_videos
 
@@ -60,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sam2-repo",
         type=Path,
-        default="third_party/sam2",
+        default=REPO_DIR / "third_party" / "sam2",
         help="Path to the cloned SAM2 repository",
     )
     parser.add_argument(
@@ -74,7 +75,22 @@ def parse_args() -> argparse.Namespace:
         default="configs/sam2.1/sam2.1_hiera_b+.yaml",
         help="SAM2 model config",
     )
-    parser.add_argument("--device", default="cuda", help="auto, cuda, cpu, or mps")
+    parser.add_argument("--device", default="auto", help="auto, cuda, cpu, or mps")
+    parser.add_argument(
+        "--dino-repo",
+        type=Path,
+        default=Path(ReIDOptions.repo),
+        help="Local DINOv3 source repository",
+    )
+    parser.add_argument(
+        "--dino-checkpoint",
+        type=Path,
+        default=Path(ReIDOptions.checkpoint),
+        help="Local DINOv3 pretrained weights",
+    )
+    parser.add_argument(
+        "--no-reid", action="store_true", help="Use the SAM2-only comparison baseline"
+    )
     parser.add_argument("--host", default="127.0.0.1", help="Server address")
     parser.add_argument("--port", type=int, default=16666, help="Server port")
     parser.add_argument(
@@ -85,6 +101,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    configure_local_proxy_bypass(args.host)
     try:
         np, cv2, gr = load_runtime_libraries()
         video_root = args.video_dir.expanduser().resolve()
@@ -99,11 +116,17 @@ def main() -> int:
             np=np,
             cv2=cv2,
             gr=gr,
+            reid_options=ReIDOptions(
+                enabled=not args.no_reid,
+                repo=str(args.dino_repo.expanduser()),
+                checkpoint=str(args.dino_checkpoint.expanduser()),
+            ),
         )
         demo.queue(default_concurrency_limit=1).launch(
             server_name=args.host,
             server_port=args.port,
             share=args.share,
+            **demo.basketedit_launch_kwargs,
         )
     except (FileNotFoundError, NotADirectoryError, RuntimeError, ValueError) as exc:
         print(f"Startup failed: {exc}", file=sys.stderr)

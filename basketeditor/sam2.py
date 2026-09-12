@@ -5,11 +5,13 @@ from __future__ import annotations
 import gc
 import importlib
 import sys
+import tempfile
+from collections import OrderedDict
 from contextlib import nullcontext, suppress
 from pathlib import Path
 from typing import Any
 
-from .models import ID_TO_TARGET, TARGET_IDS, TrackPoint, VideoInfo
+from .models import TARGET_IDS, TrackPoint, VideoInfo
 
 
 def select_device(torch: Any, requested_device: str) -> str:
@@ -45,7 +47,8 @@ def _load_torch(sam2_repo: Path | None) -> Any:
 
 def _autocast(torch: Any, device: str) -> Any:
     if device.startswith("cuda"):
-        return torch.autocast("cuda", dtype=torch.bfloat16)
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        return torch.autocast("cuda", dtype=dtype)
     return nullcontext()
 
 
@@ -82,6 +85,213 @@ def mask_to_track_point(frame_idx: int, mask: Any, np: Any) -> TrackPoint:
     )
 
 
+def _numpy_mask(mask: Any, np: Any) -> Any:
+    if hasattr(mask, "detach"):
+        mask = mask.detach().float().cpu().numpy()
+    return np.squeeze(np.asarray(mask))
+
+
+def select_component(
+    raw_mask: Any,
+    np: Any,
+    cv2: Any,
+    points: list[dict],
+    previous: TrackPoint | None = None,
+) -> Any:
+    """Keep a single coherent component, preferentially the one the user clicked."""
+    array = _numpy_mask(raw_mask, np)
+    if array.ndim != 2:
+        raise RuntimeError(f"Invalid SAM2 mask dimensions: {array.shape}")
+    if cv2 is None:
+        return array
+    count, labels, stats, centers = cv2.connectedComponentsWithStats(
+        (array > 0).astype(np.uint8), 8
+    )
+    if count <= 1:
+        return array
+    positive = [p for p in points if p["label"] == 1 and "box" not in p]
+    votes = {}
+    for point in positive:
+        x, y = round(point["x"]), round(point["y"])
+        component = int(
+            labels[min(y, labels.shape[0] - 1), min(x, labels.shape[1] - 1)]
+        )
+        if component:
+            votes[component] = votes.get(component, 0) + 1
+    if votes:
+        chosen = max(votes, key=lambda c: (votes[c], stats[c, cv2.CC_STAT_AREA]))
+    else:
+        boxes = [p["box"] for p in points if "box" in p]
+        reference = (
+            ((boxes[-1][0] + boxes[-1][2]) / 2, (boxes[-1][1] + boxes[-1][3]) / 2)
+            if boxes
+            else (previous.center if previous and previous.visible else None)
+        )
+
+        def rank(component: int) -> float:
+            area = float(stats[component, cv2.CC_STAT_AREA])
+            if reference is None:
+                return area
+            distance = float(np.linalg.norm(centers[component] - np.asarray(reference)))
+            return area**0.5 / (1 + distance)
+
+        chosen = max(range(1, count), key=rank)
+    return np.where(labels == chosen, array, -32.0)
+
+
+class LazyVideoFrames:
+    """SAM2-compatible indexed frames with a bounded CPU cache (no full-video tensor)."""
+
+    def __init__(self, directory: Path, count: int, size: int, torch: Any, np: Any):
+        self.directory, self.count, self.size = directory, count, size
+        self.torch, self.np = torch, np
+        self.cache: OrderedDict = OrderedDict()
+
+    def __len__(self) -> int:
+        return self.count
+
+    def __getitem__(self, index: int) -> Any:
+        if not 0 <= index < self.count:
+            raise IndexError(index)
+        if index not in self.cache:
+            from PIL import Image
+
+            with Image.open(self.directory / f"{index:08d}.jpg") as image:
+                array = (
+                    self.np.array(
+                        image.convert("RGB").resize((self.size, self.size)),
+                        dtype=self.np.float32,
+                    )
+                    / 255.0
+                )
+            tensor = self.torch.from_numpy(array).permute(2, 0, 1)
+            mean = self.torch.tensor((0.485, 0.456, 0.406))[:, None, None]
+            std = self.torch.tensor((0.229, 0.224, 0.225))[:, None, None]
+            self.cache[index] = (tensor - mean) / std
+            if len(self.cache) > 4:
+                self.cache.popitem(last=False)
+        self.cache.move_to_end(index)
+        return self.cache[index]
+
+
+def init_lazy_state(
+    predictor: Any, frames_dir: Path, info: VideoInfo, torch: Any, np: Any
+) -> Any:
+    # Initialize the official state on one frame, then provide its public indexed
+    # image store. Model/state initialization stays owned by the installed SAM2.
+    with tempfile.TemporaryDirectory(
+        prefix="sam2_init_", dir=frames_dir.parent
+    ) as temp:
+        (Path(temp) / "00000000.jpg").symlink_to(
+            (frames_dir / "00000000.jpg").resolve()
+        )
+        state = predictor.init_state(
+            video_path=temp, offload_video_to_cpu=True, offload_state_to_cpu=True
+        )
+    state["images"] = LazyVideoFrames(
+        frames_dir, info.frame_count, predictor.image_size, torch, np
+    )
+    state["num_frames"] = info.frame_count
+    return state
+
+
+def _track_prompted(
+    predictor, state, info, groups, masks_dir, np, cv2, scene_cuts, progress
+):
+    """Small SAM2-only baseline, with separate memory for each object/direction."""
+    tracks = {
+        target: [TrackPoint(i) for i in range(info.frame_count)]
+        for target in TARGET_IDS
+    }
+    boundaries = sorted({0, info.frame_count, *(scene_cuts or [])})
+    for target, object_id in TARGET_IDS.items():
+        ranks = {}
+        if masks_dir is not None:
+            (masks_dir / target).mkdir(parents=True, exist_ok=True)
+        for begin, end in zip(boundaries, boundaries[1:]):
+            prompts = {
+                i: points
+                for (name, i), points in groups.items()
+                if name == target and begin <= i < end
+            }
+            anchors = sorted(
+                i for i, pts in prompts.items() if any(p["label"] == 1 for p in pts)
+            )
+            if not anchors:
+                continue
+            for reverse in (False, True):
+                predictor.reset_state(state)
+                previous = None
+
+                def consume(output):
+                    nonlocal previous
+                    index, ids, masks = output
+                    index = int(index)
+                    for j, oid in enumerate(ids):
+                        if int(oid) != object_id:
+                            continue
+                        mask = select_component(
+                            masks[j], np, cv2, prompts.get(index, []), previous
+                        )
+                        point = mask_to_track_point(index, mask, np)
+                        point.anchored = index in anchors
+                        point.source = "anchor" if point.anchored else "sam2"
+                        rank = (
+                            point.anchored,
+                            point.visible,
+                            -min(abs(index - a) for a in anchors),
+                            point.confidence,
+                        )
+                        if index not in ranks or rank > ranks[index]:
+                            ranks[index] = rank
+                            tracks[target][index] = point
+                            if masks_dir is not None and point.visible:
+                                path = masks_dir / target / f"{index:08d}.png"
+                                if not cv2.imwrite(
+                                    str(path), (mask > 0).astype(np.uint8) * 255
+                                ):
+                                    raise RuntimeError(
+                                        f"Could not write tracking mask: {path}"
+                                    )
+                        if point.visible:
+                            previous = point
+
+                for index, points in sorted(prompts.items()):
+                    coords = np.asarray(
+                        [[p["x"], p["y"]] for p in points if "box" not in p], np.float32
+                    ).reshape(-1, 2)
+                    labels = np.asarray(
+                        [p["label"] for p in points if "box" not in p], np.int32
+                    )
+                    kwargs = dict(
+                        inference_state=state,
+                        frame_idx=index,
+                        obj_id=object_id,
+                        points=coords if len(coords) else None,
+                        labels=labels if len(labels) else None,
+                    )
+                    boxes = [p["box"] for p in points if "box" in p]
+                    if boxes:
+                        kwargs["box"] = np.asarray(boxes[-1], np.float32)
+                    consume(predictor.add_new_points_or_box(**kwargs))
+                previous = None
+                start = anchors[-1] if reverse else anchors[0]
+                length = start - begin if reverse else end - start - 1
+                for output in predictor.propagate_in_video(
+                    state,
+                    start_frame_idx=start,
+                    max_frame_num_to_track=length,
+                    reverse=reverse,
+                ):
+                    consume(output)
+                    if progress:
+                        progress(
+                            0.2 + 0.53 * int(output[0]) / max(1, info.frame_count),
+                            desc=f"SAM2 {target}",
+                        )
+    return tracks
+
+
 def run_sam2_tracking(
     frames_dir: Path,
     info: VideoInfo,
@@ -93,113 +303,85 @@ def run_sam2_tracking(
     np: Any,
     masks_dir: Path | None = None,
     cv2: Any = None,
+    scene_cuts: list[int] | None = None,
+    progress: Any = None,
+    reid_options: Any = None,
+    diagnostics: dict | None = None,
+    identity_file: Path | None = None,
 ) -> dict[str, list[TrackPoint]]:
-    """注入三个目标的提示点，并对视频进行前向和反向掩码传播。"""
+    """Track with permanent manual identity templates and verified reacquisition.
+
+    All annotated views initialize a fixed identity gallery, then a single scan
+    searches even before the first annotation and after camera cuts. SAM2-only
+    propagation remains an explicit baseline, never a silent model fallback.
+    """
+    from .annotations import validate_annotations
+    from .models import ReIDOptions
+
+    annotations = validate_annotations(annotations, info, require_all=False)
+    options = reid_options or ReIDOptions()
     if not checkpoint.is_file():
         raise FileNotFoundError(f"SAM2 checkpoint not found: {checkpoint}")
+    if options.enabled:
+        if not Path(options.repo).is_dir() or not Path(options.checkpoint).is_file():
+            raise FileNotFoundError(
+                "本地 DINOv3 源码或权重不存在，请检查 --dino-repo / --dino-checkpoint。"
+            )
+        if cv2 is None:
+            cv2 = importlib.import_module("cv2")
+    if masks_dir is not None and cv2 is None:
+        raise ValueError("cv2 is required when masks_dir is provided")
     torch = _load_torch(sam2_repo)
-    try:
-        builder = importlib.import_module("sam2.build_sam").build_sam2_video_predictor
-    except (ImportError, OSError) as exc:
-        raise RuntimeError(
-            "Could not import the official SAM2 package. See the setup instructions."
-        ) from exc
-
+    builder = importlib.import_module("sam2.build_sam").build_sam2_video_predictor
     device = select_device(torch, device_setting)
+    predictor = image_predictor = inference_state = None
+    groups = {}
+    for point in annotations:
+        groups.setdefault((point["target"], point["frame_idx"]), []).append(point)
     try:
         predictor = builder(model_config, str(checkpoint.resolve()), device=device)
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not build the SAM2 predictor. Check model config {model_config!r}."
-        ) from exc
+        with torch.inference_mode(), _autocast(torch, device):
+            inference_state = init_lazy_state(predictor, frames_dir, info, torch, np)
+            if options.enabled:
+                from .tracker import track_identities
 
-    track_dict: dict[str, dict[int, TrackPoint]] = {target: {} for target in TARGET_IDS}
-    if masks_dir is not None:
-        if cv2 is None:
-            raise ValueError("cv2 is required when masks_dir is provided.")
-        for target in TARGET_IDS:
-            (masks_dir / target).mkdir(parents=True, exist_ok=True)
-
-    def consume_output(output: tuple[Any, Any, Any]) -> None:
-        frame_idx_value, obj_ids, mask_values = output
-        frame_idx = int(frame_idx_value)
-        if hasattr(obj_ids, "detach"):
-            obj_ids = obj_ids.detach().cpu().numpy()
-        for position, raw_obj_id in enumerate(np.asarray(obj_ids).reshape(-1).tolist()):
-            target = ID_TO_TARGET.get(int(raw_obj_id))
-            if target is None:
-                continue
-            raw_mask = mask_values[position]
-            candidate = mask_to_track_point(frame_idx, raw_mask, np)
-            current = track_dict[target].get(frame_idx)
-            if (
-                current is None
-                or (candidate.visible and not current.visible)
-                or candidate.confidence > current.confidence
-            ):
-                track_dict[target][frame_idx] = candidate
-                if masks_dir is not None and candidate.visible:
-                    if hasattr(raw_mask, "detach"):
-                        raw_mask = raw_mask.detach()
-                    if hasattr(raw_mask, "float"):
-                        raw_mask = raw_mask.float()
-                    if hasattr(raw_mask, "cpu"):
-                        raw_mask = raw_mask.cpu()
-                    if hasattr(raw_mask, "numpy"):
-                        raw_mask = raw_mask.numpy()
-                    mask_array = np.squeeze(np.asarray(raw_mask)) > 0.0
-                    mask_path = masks_dir / target / f"{frame_idx:08d}.png"
-                    if not cv2.imwrite(
-                        str(mask_path), mask_array.astype(np.uint8) * 255
-                    ):
-                        raise RuntimeError(
-                            f"Could not write tracking mask: {mask_path}"
-                        )
-
-    groups: dict[tuple[str, int], list[dict[str, Any]]] = {}
-    for point in annotations:
-        groups.setdefault((point["target"], int(point["frame_idx"])), []).append(point)
-    annotated_frames = [frame_idx for _, frame_idx in groups]
-
-    with torch.inference_mode(), _autocast(torch, device):
-        inference_state = predictor.init_state(
-            video_path=str(frames_dir),
-            offload_video_to_cpu=True,
-            offload_state_to_cpu=False,
-        )
-        predictor.reset_state(inference_state)
-        for (target, frame_idx), points in sorted(
-            groups.items(), key=lambda item: item[0][1]
-        ):
-            coords = np.asarray(
-                [[point["x"], point["y"]] for point in points], dtype=np.float32
-            )
-            labels = np.asarray([point["label"] for point in points], dtype=np.int32)
-            consume_output(
-                predictor.add_new_points_or_box(
-                    inference_state=inference_state,
-                    frame_idx=frame_idx,
-                    obj_id=TARGET_IDS[target],
-                    points=coords,
-                    labels=labels,
+                image_class = importlib.import_module(
+                    "sam2.sam2_image_predictor"
+                ).SAM2ImagePredictor
+                image_predictor = image_class(predictor)
+                return track_identities(
+                    predictor,
+                    image_predictor,
+                    inference_state,
+                    frames_dir,
+                    info,
+                    groups,
+                    options,
+                    masks_dir,
+                    scene_cuts,
+                    progress,
+                    diagnostics if diagnostics is not None else {},
+                    identity_file,
                 )
+            return _track_prompted(
+                predictor,
+                inference_state,
+                info,
+                groups,
+                masks_dir,
+                np,
+                cv2,
+                scene_cuts,
+                progress,
             )
-        for output in predictor.propagate_in_video(
-            inference_state, start_frame_idx=min(annotated_frames), reverse=False
-        ):
-            consume_output(output)
-        for output in predictor.propagate_in_video(
-            inference_state, start_frame_idx=max(annotated_frames), reverse=True
-        ):
-            consume_output(output)
-
-    return {
-        target: [
-            track_dict[target].get(frame_idx, TrackPoint(frame_idx))
-            for frame_idx in range(info.frame_count)
-        ]
-        for target in TARGET_IDS
-    }
+    finally:
+        if predictor is not None and inference_state is not None:
+            with suppress(Exception):
+                predictor.reset_state(inference_state)
+        del image_predictor, inference_state, predictor
+        gc.collect()
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
 
 
 class Sam2Preview:
@@ -296,17 +478,23 @@ class Sam2Preview:
             if not any(int(point["label"]) == 1 for point in points):
                 continue
             coords = self.np.asarray(
-                [[point["x"], point["y"]] for point in points],
+                [[point["x"], point["y"]] for point in points if "box" not in point],
                 dtype=self.np.float32,
             )
+            coords = coords.reshape(-1, 2)
+            boxes = [point["box"] for point in points if "box" in point]
             labels = self.np.asarray(
-                [int(point["label"]) for point in points], dtype=self.np.int32
+                [int(point["label"]) for point in points if "box" not in point],
+                dtype=self.np.int32,
             )
             with torch.inference_mode(), _autocast(torch, device):
                 masks, scores, _ = predictor.predict(
-                    point_coords=coords,
-                    point_labels=labels,
-                    multimask_output=len(points) == 1,
+                    point_coords=coords if len(coords) else None,
+                    point_labels=labels if len(labels) else None,
+                    box=self.np.asarray(boxes[-1], dtype=self.np.float32)
+                    if boxes
+                    else None,
+                    multimask_output=len(points) == 1 and not boxes,
                 )
             masks = self.np.asarray(masks)
             scores = self.np.asarray(scores).reshape(-1)
